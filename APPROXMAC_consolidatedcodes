@@ -1,0 +1,202 @@
+// ===============================================================
+// Top Module: ApproxMAC_AWM3
+// ===============================================================
+module ApproxMAC_AWM3 (
+ input clk,
+ input rst,
+ input [7:0] X,
+ input [7:0] Y,
+ output [19:0] Result
+);
+ wire [7:0] regX_out, regY_out;
+ wire [15:0] CR, MUL, selected;
+ wire MA;
+ // Registers
+ Register #(8) regX(.clk(clk), .rst(rst), .load(1'b1), .d(X), .q(regX_out));
+ Register #(8) regY(.clk(clk), .rst(rst), .load(1'b1), .d(Y), .q(regY_out));
+ // Conditional approximation logic
+ ConditionalBlock cb(.X(regX_out), .Y(regY_out), .CR(CR), .MA(MA));
+ // Approximate Multiplier (AWM3)
+ AWM3 mul(.a(regX_out), .b(regY_out), .product(MUL));
+ // Select between Conditional or Multiplier result
+ ResultSelector rs(.CR(CR), .MUL(MUL), .MA(MA), .selected(selected));
+ // Zero-extend to 20-bit output
+ assign Result = {4'b0000, selected};
+endmodule
+24
+// ===============================================================
+// Module: Register
+// ===============================================================
+module Register #(parameter WIDTH = 8)(
+ input clk,
+ input rst,
+ input load,
+ input [WIDTH-1:0] d,
+ output reg [WIDTH-1:0] q
+);
+ always @(posedge clk or posedge rst) begin
+ if (rst)
+ q <= 0;
+ else if (load)
+ q <= d;
+ end
+endmodule
+// ===============================================================
+// Module: ConditionalBlock
+// ===============================================================
+module ConditionalBlock (
+ input [7:0] X, Y,
+ output reg [15:0] CR,
+ output reg MA
+);
+ // Check if a value is power of 2
+ function isPowerOf2;
+ input [7:0] val;
+ isPowerOf2 = (val & (val - 1)) == 0 && val != 0;
+ endfunction
+ // Compute log2(value)
+ function integer log2_func;
+ input [15:0] val;
+ integer i;
+ begin
+ log2_func = 0;
+ for (i = 0; i < 16; i = i + 1)
+ if ((val >> i) & 1)
+25
+ log2_func = i;
+ end
+ endfunction
+ // Map approximable ranges to nearest power of 2
+ function [15:0] approx_to_pow2;
+ input [7:0] val;
+ begin
+ if (isPowerOf2(val)) approx_to_pow2 = val;
+ else if (val >= 8'd2 && val <= 8'd3) approx_to_pow2 = 16'd2;
+ else if (val >= 8'd4 && val <= 8'd5) approx_to_pow2 = 16'd4;
+ else if (val >= 8'd6 && val <= 8'd11) approx_to_pow2 = 16'd8;
+ else if (val >= 8'd12 && val <= 8'd19) approx_to_pow2 = 16'd16;
+ else if (val >= 8'd20 && val <= 8'd23) approx_to_pow2 = 16'd16;
+ else if (val >= 8'd24 && val <= 8'd39) approx_to_pow2 = 16'd32;
+ else if (val >= 8'd40 && val <= 8'd47) approx_to_pow2 = 16'd32;
+ else if (val >= 8'd48 && val <= 8'd71) approx_to_pow2 = 16'd64;
+ else if (val >= 8'd72 && val <= 8'd95) approx_to_pow2 = 16'd128;
+ else if (val >= 8'd96 && val <= 8'd159) approx_to_pow2 = 16'd128;
+ else if (val >= 8'd160 && val <= 8'd255) approx_to_pow2 = 16'd256;
+ else approx_to_pow2 = val;
+ end
+ endfunction
+ reg [15:0] newX, newY;
+ always @(*) begin
+ CR = 0;
+ MA = 0;
+ if (X == 0 || Y == 0) begin
+ CR = 0;
+ MA = 1;
+ end
+ else if (isPowerOf2(X)) begin
+ CR = Y << log2_func(X);
+ MA = 1;
+ end
+ else if (isPowerOf2(Y)) begin
+ CR = X << log2_func(Y);
+ MA = 1;
+26
+ end
+ else if (approx_to_pow2(X) != X) begin
+ newX = approx_to_pow2(X);
+ CR = Y << log2_func(newX);
+ MA = 1;
+ end
+ else if (approx_to_pow2(Y) != Y) begin
+ newY = approx_to_pow2(Y);
+ CR = X << log2_func(newY);
+ MA = 1;
+ end
+ else begin
+ CR = 0; // fallback uses AWM3
+ MA = 0;
+ end
+ end
+endmodule
+// ===============================================================
+// Module: AWM3 (Approximate Multiplier)
+// ===============================================================
+module AWM3 (
+ input wire [7:0] a, b,
+ output wire [15:0] product
+);
+ localparam integer APP_BITS = 9;
+ wire [15:0] pp [7:0];
+ genvar i;
+ generate
+ for (i = 0; i < 8; i = i + 1) begin : gen_pp
+ assign pp[i] = {8'b0, (a & {8{b[i]}})} << i;
+ end
+ endgenerate
+ wire [15:0] s1, s2, s3, s4, s5, s6, s7;
+ stage_adder_dafa3 #(.APP_BITS(APP_BITS)) add1 (.a(pp[0]), .b(pp[1]), .sum(s1));
+ stage_adder_dafa3 #(.APP_BITS(APP_BITS)) add2 (.a(s1), .b(pp[2]), .sum(s2));
+ stage_adder_dafa3 #(.APP_BITS(APP_BITS)) add3 (.a(s2), .b(pp[3]), .sum(s3));
+ stage_adder_dafa3 #(.APP_BITS(APP_BITS)) add4 (.a(s3), .b(pp[4]), .sum(s4));
+ stage_adder_dafa3 #(.APP_BITS(APP_BITS)) add5 (.a(s4), .b(pp[5]), .sum(s5));
+27
+ stage_adder_dafa3 #(.APP_BITS(APP_BITS)) add6 (.a(s5), .b(pp[6]), .sum(s6));
+ stage_adder_dafa3 #(.APP_BITS(APP_BITS)) add7 (.a(s6), .b(pp[7]), .sum(product));
+endmodule
+// ===============================================================
+// Module: ResultSelector
+// ===============================================================
+module ResultSelector (
+ input [15:0] CR,
+ input [15:0] MUL,
+ input MA,
+ output [15:0] selected
+);
+ assign selected = (MA) ? CR : MUL;
+endmodule
+// ===============================================================
+// Module: stage_adder_dafa3
+// ===============================================================
+module stage_adder_dafa3 #(parameter APP_BITS = 9)(
+ input wire [15:0] a, b,
+ output wire [15:0] sum
+);
+ wire [15:0] carry;
+ assign carry[0] = 1'b0;
+ genvar i;
+ generate
+ for (i = 0; i < 16; i = i + 1) begin : loop
+ wire s, c;
+ if (i < APP_BITS)
+ fa_dafa3 fa(.a(a[i]), .b(b[i]), .cin(carry[i]), .sum(s), .cout(c));
+ else
+ fa_exact fa(.a(a[i]), .b(b[i]), .cin(carry[i]), .sum(s), .cout(c));
+ assign sum[i] = s;
+ if (i < 15) assign carry[i + 1] = c;
+ end
+ endgenerate
+endmodule
+28
+// ===============================================================
+// Module: fa_dafa3 (Approximate Full Adder)
+// ===============================================================
+module fa_dafa3(
+ input wire a, b, cin,
+ output wire sum, cout
+);
+ wire axorb = (a & ~b) | (~a & b);
+ wire parity = (axorb & ~cin) | ((~axorb) & cin);
+ wire all_ones = a & b & cin;
+ assign sum = parity & ~all_ones;
+ assign cout = (a & b) | (b & cin) | (a & cin); // exact carry
+endmodule
+// ===============================================================
+// Module: fa_exact (Exact Full Adder)
+// ===============================================================
+module fa_exact(
+ input wire a, b, cin,
+ output wire sum, cout
+);
+ assign sum = a ^ b ^ cin;
+ assign cout = (a & b) | (b & cin) | (a & cin);
+endmodule
